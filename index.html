@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Detector de Números</title>
+    <script src='https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/tesseract.min.js'></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-color: #f0f0f0;
+        }
+
+        .container {
+            max-width: 800px;
+            width: 100%;
+            text-align: center;
+        }
+
+        .video-container {
+            position: relative;
+            margin: 20px 0;
+            width: 100%;
+            max-width: 640px;
+            background: #000;
+        }
+
+        #video {
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+        }
+
+        #canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        #processingCanvas {
+            display: none;
+        }
+
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+
+        #resultado {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            font-size: 24px;
+            font-weight: bold;
+            min-height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .debug-info {
+            font-size: 12px;
+            color: #666;
+            margin-top: 10px;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 10px;
+            }
+            
+            button {
+                padding: 10px 20px;
+                font-size: 14px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Detector de Números</h1>
+        
+        <div class="video-container">
+            <video id="video" autoplay playsinline></video>
+            <canvas id="canvas"></canvas>
+        </div>
+        <canvas id="processingCanvas"></canvas>
+
+        <div class="controls">
+            <button id="iniciarCamara">Abrir Cámara</button>
+            <button id="detenerCamara" disabled>Cerrar Cámara</button>
+            <button id="cambiarCamara" disabled>Cambiar Cámara</button>
+        </div>
+
+        <div id="resultado">
+            Números detectados aparecerán aquí
+        </div>
+        <div class="debug-info" id="debugInfo"></div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const processingCanvas = document.getElementById('processingCanvas');
+        const ctx = canvas.getContext('2d');
+        const pCtx = processingCanvas.getContext('2d');
+        const resultado = document.getElementById('resultado');
+        const debugInfo = document.getElementById('debugInfo');
+        const btnIniciar = document.getElementById('iniciarCamara');
+        const btnDetener = document.getElementById('detenerCamara');
+        const btnCambiar = document.getElementById('cambiarCamara');
+        
+        let stream = null;
+        let procesando = false;
+        let ultimoNumero = '';
+        let contadorCoincidencias = 0;
+        let camaraActual = 'environment';
+        let ultimaDeteccion = Date.now();
+        const INTERVALO_DETECCION = 1000; // 1 segundo entre detecciones
+
+        // Configurar Tesseract con opciones optimizadas
+        const worker = Tesseract.createWorker({
+            logger: m => {
+                console.log(m);
+                if (m.status === 'recognizing text') {
+                    debugInfo.textContent = `Progreso: ${Math.round(m.progress * 100)}%`;
+                }
+            }
+        });
+
+        async function inicializarTesseract() {
+            await worker.load();
+            await worker.loadLanguage('eng');
+            await worker.initialize('eng');
+            await worker.setParameters({
+                tessedit_char_whitelist: '0123456789',
+                tessedit_pageseg_mode: '7', // Treat the image as a single text line
+                tessedit_ocr_engine_mode: '2', // Use neural nets mode
+                preserve_interword_spaces: '0',
+                textord_min_linesize: '2.5'
+            });
+        }
+
+        inicializarTesseract();
+
+        function preprocesarImagen(sourceCtx, width, height) {
+            // Aumentar contraste y convertir a escala de grises
+            const imageData = sourceCtx.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            
+            for (let i = 0; i < data.length; i += 4) {
+                const r = data[i];
+                const g = data[i + 1];
+                const b = data[i + 2];
+                
+                // Convertir a escala de grises
+                const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+                
+                // Aumentar contraste
+                const contrast = 1.5; // Factor de contraste
+                const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
+                const color = factor * (gray - 128) + 128;
+                
+                // Umbralización
+                const threshold = 128;
+                const final = color > threshold ? 255 : 0;
+                
+                data[i] = final;
+                data[i + 1] = final;
+                data[i + 2] = final;
+            }
+            
+            sourceCtx.putImageData(imageData, 0, 0);
+        }
+
+        async function iniciarCamara() {
+            try {
+                const constraints = {
+                    video: {
+                        facingMode: camaraActual,
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        focusMode: 'continuous',
+                        exposureMode: 'continuous',
+                        whiteBalanceMode: 'continuous'
+                    }
+                };
+                
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                btnIniciar.disabled = true;
+                btnDetener.disabled = false;
+                btnCambiar.disabled = false;
+                
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    processingCanvas.width = video.videoWidth;
+                    processingCanvas.height = video.videoHeight;
+                    detectarNumeros();
+                };
+            } catch (err) {
+                console.error('Error al acceder a la cámara:', err);
+                alert('Error al acceder a la cámara. Asegúrate de dar permisos.');
+            }
+        }
+
+        function detenerCamara() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                resultado.textContent = 'Números detectados aparecerán aquí';
+                btnIniciar.disabled = false;
+                btnDetener.disabled = true;
+                btnCambiar.disabled = true;
+                ultimoNumero = '';
+                contadorCoincidencias = 0;
+            }
+        }
+
+        async function detectarNumeros() {
+            if (!stream || procesando) return;
+            
+            const ahora = Date.now();
+            if (ahora - ultimaDeteccion < INTERVALO_DETECCION) {
+                requestAnimationFrame(detectarNumeros);
+                return;
+            }
+            
+            procesando = true;
+            ultimaDeteccion = ahora;
+            
+            try {
+                // Dibujar frame actual en el canvas de procesamiento
+                pCtx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
+                
+                // Preprocesar imagen
+                preprocesarImagen(pCtx, processingCanvas.width, processingCanvas.height);
+                
+                // Reconocer texto
+                const { data: { text } } = await worker.recognize(processingCanvas);
+                let numeros = text.match(/\d{6,}/g); // Buscar secuencias de 6 o más dígitos
+                
+                // Dibujar frame actual en el canvas visible
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                if (numeros && numeros.length > 0) {
+                    const numeroDetectado = numeros[0];
+                    
+                    if (numeroDetectado === ultimoNumero) {
+                        contadorCoincidencias++;
+                        
+                        if (contadorCoincidencias >= 2) {
+                            resultado.textContent = numeroDetectado;
+                            
+                            // Dibujar rectángulo
+                            ctx.strokeStyle = '#00ff00';
+                            ctx.lineWidth = 4;
+                            ctx.strokeRect(20, 20, canvas.width - 40, canvas.height - 40);
+                            
+                            // Mostrar mensaje de éxito
+                            debugInfo.textContent = '¡Número detectado con éxito!';
+                        }
+                    } else {
+                        ultimoNumero = numeroDetectado;
+                        contadorCoincidencias = 1;
+                    }
+                }
+            } catch (error) {
+                console.error('Error en la detección:', error);
+                debugInfo.textContent = 'Error en la detección';
+            }
+            
+            procesando = false;
+            requestAnimationFrame(detectarNumeros);
+        }
+
+        btnCambiar.addEventListener('click', () => {
+            camaraActual = camaraActual === 'environment' ? 'user' : 'environment';
+            detenerCamara();
+            iniciarCamara();
+        });
+
+        btnIniciar.addEventListener('click', iniciarCamara);
+        btnDetener.addEventListener('click', detenerCamara);
+    </script>
+</body>
+</html> 
